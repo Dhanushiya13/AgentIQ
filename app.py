@@ -107,20 +107,12 @@ def match_browsing_categories(customer: Dict, products: pd.DataFrame) -> pd.Data
     
     return matched if not matched.empty else products
 
-def get_diverse_recommendations(customer_id: str, items_df: pd.DataFrame, customer_data: Dict, k: int = 4) -> pd.DataFrame:
-    """Get highly accurate and personalized product recommendations.
-    
-    Uses a sophisticated multi-factor scoring algorithm that considers:
-    1. Product category affinity based on browsing history
-    2. Price point alignment with customer segment
-    3. Demographic relevance based on age, location
-    4. Product rating and popularity
-    5. Previous recommendation history to avoid repetition
-    """
+def get_diverse_recommendations(customer_id: str, items_df: pd.DataFrame, k: int = 4) -> pd.DataFrame:
+    """Get diverse product recommendations with history tracking to avoid repetition."""
     if items_df.empty:
         return pd.DataFrame()
     
-    # Initialize session state for tracking recommendation history
+    # Initialize session state for tracking recommendation history if it doesn't exist
     if SESSION_STATE_KEY not in st.session_state:
         st.session_state[SESSION_STATE_KEY] = {}
     
@@ -130,252 +122,133 @@ def get_diverse_recommendations(customer_id: str, items_df: pd.DataFrame, custom
     # Get previously recommended product IDs for this customer
     previous_recommendations = st.session_state[SESSION_STATE_KEY][customer_id]
     
-    # Create a copy of the dataframe to avoid modifying the original
-    scored_products = items_df.copy()
-    
-    # Calculate affinity score for each product
-    # Higher score = better match for the customer
-    
-    # FACTOR 1: Category affinity based on browsing history (0-5 points)
-    browsing_history = parse_browsing_history(customer_data.get('Browsing_History', ''))
-    
-    def calculate_category_score(row):
-        # Direct match with browsing history gets highest score
-        if row['Category'] in browsing_history:
-            return 5
-        # Subcategory match gets second highest
-        elif row['Subcategory'] in browsing_history:
-            return 4
-        # Look for partial matches in browsing history categories
-        for category in browsing_history:
-            # Check if the category name is contained in another (e.g., "Kitchen" in "Kitchen Appliances")
-            if (isinstance(category, str) and isinstance(row['Category'], str) and 
-                (category.lower() in row['Category'].lower() or row['Category'].lower() in category.lower())):
-                return 3
-        return 0
-    
-    scored_products['category_score'] = scored_products.apply(calculate_category_score, axis=1)
-    
-    # FACTOR 2: Price point alignment with customer segment (0-3 points)
-    customer_segment = customer_data.get('Customer_Segment', '')
-    
-    def calculate_price_score(row):
-        try:
-            price = float(row['Price'])
-            if customer_segment == 'Premium':
-                # Premium customers prefer higher-priced items
-                if price > 5000:
-                    return 3
-                elif price > 2000:
-                    return 2
-                elif price > 1000:
-                    return 1
-            elif customer_segment == 'Budget':
-                # Budget customers prefer lower-priced items
-                if price < 500:
-                    return 3
-                elif price < 1000:
-                    return 2
-                elif price < 2000:
-                    return 1
-            else:
-                # Mid-range customers prefer mid-range prices
-                if 1000 <= price <= 3000:
-                    return 3
-                elif 500 <= price <= 4000:
-                    return 2
-                else:
-                    return 1
-        except (ValueError, TypeError):
-            return 0
-        return 0
-    
-    scored_products['price_score'] = scored_products.apply(calculate_price_score, axis=1)
-    
-    # FACTOR 3: Demographic relevance (0-3 points)
-    age = customer_data.get('Age', 0)
-    location = customer_data.get('Location', '')
-    
-    def calculate_demographic_score(row):
-        score = 0
+    # Filter out previously recommended products when possible
+    available_products = items_df.copy()
+    if previous_recommendations and len(available_products) > k:
+        # Only filter if we have history and enough products to recommend
+        available_products = available_products[~available_products['Product_ID'].isin(previous_recommendations)]
         
-        # Age-based preferences
-        if age < 25 and row['Category'] in ['Electronics', 'Fashion', 'Gaming']:
-            score += 1
-        elif 25 <= age < 40 and row['Category'] in ['Home & Kitchen', 'Electronics', 'Fitness']:
-            score += 1
-        elif age >= 40 and row['Category'] in ['Health', 'Home & Kitchen', 'Books']:
-            score += 1
-            
-        # Location-based preferences
-        if location == 'Urban' and row['Category'] in ['Electronics', 'Fashion', 'Dining']:
-            score += 1
-        elif location == 'Suburban' and row['Category'] in ['Home & Kitchen', 'Garden', 'Appliances']:
-            score += 1
-        elif location == 'Rural' and row['Category'] in ['Tools', 'Outdoors', 'Garden']:
-            score += 1
-            
-        # Additional affinity for specific subcategories
-        target_subcategories = []
+        # If filtering makes dataset too small, use original dataset
+        if len(available_products) < k:
+            available_products = items_df.copy()
+    
+    # If still more products than needed, create a diverse selection
+    if len(available_products) > k:
+        # Ensure diversity through multiple strategies
+        seed = int(hashlib.md5((customer_id + datetime.now().strftime('%Y%m%d')).encode()).hexdigest(), 16) % 10000
+        random.seed(seed)
         
-        if age < 25:
-            target_subcategories = ['Smartphones', 'Headphones', 'Sneakers']
-        elif 25 <= age < 40:
-            target_subcategories = ['Coffee Makers', 'Laptops', 'Fitness Trackers']
-        else:
-            target_subcategories = ['Health Monitors', 'Kitchen Appliances', 'Books']
-            
-        if isinstance(row['Subcategory'], str) and row['Subcategory'] in target_subcategories:
-            score += 1
-            
-        return min(score, 3)  # Cap at 3 points
-    
-    scored_products['demographic_score'] = scored_products.apply(calculate_demographic_score, axis=1)
-    
-    # FACTOR 4: Product rating and quality (0-2 points)
-    def calculate_rating_score(row):
-        try:
-            rating = float(row['Product_Rating'])
-            if rating >= 4.5:
-                return 2
-            elif rating >= 4.0:
-                return 1
-            else:
-                return 0
-        except (ValueError, TypeError):
-            return 0
-    
-    scored_products['rating_score'] = scored_products.apply(calculate_rating_score, axis=1)
-    
-    # FACTOR 5: Novelty - prioritize items not previously recommended (-3 to 0 points)
-    def calculate_novelty_score(row):
-        if row['Product_ID'] in previous_recommendations:
-            return -3  # Strong penalty for previously shown products
-        return 0
-    
-    scored_products['novelty_score'] = scored_products.apply(calculate_novelty_score, axis=1)
-    
-    # Calculate total recommendation score (max 13 points)
-    scored_products['total_score'] = (
-        scored_products['category_score'] + 
-        scored_products['price_score'] +
-        scored_products['demographic_score'] + 
-        scored_products['rating_score'] +
-        scored_products['novelty_score']
-    )
-    
-    # Sort by score (highest first) and get top k recommendations
-    recommended = scored_products.sort_values('total_score', ascending=False).head(k)
-    
-    # If we got fewer than k recommendations (unlikely but possible), 
-    # fill with random products not previously recommended
-    if len(recommended) < k:
-        remaining_products = items_df[~items_df['Product_ID'].isin(recommended['Product_ID'])]
-        if not remaining_products.empty:
-            additional = remaining_products.sample(min(k - len(recommended), len(remaining_products)))
-            recommended = pd.concat([recommended, additional])
-    
-    # Ensure diversity if we have enough products
-    if len(recommended) > 2 and len(items_df) > k*2:
-        category_counts = recommended['Category'].value_counts()
-        most_common_category = category_counts.index[0]
+        # Strategy 1: Get products from different categories if possible
+        unique_categories = available_products['Category'].unique()
+        selected_products = pd.DataFrame()
         
-        # If more than half of recommendations are from the same category, replace one
-        if category_counts.iloc[0] > k/2:
-            # Find recommendation(s) to replace
-            to_replace = recommended[recommended['Category'] == most_common_category].index[0]
+        if len(unique_categories) >= k:
+            # We can select one product from each of k different categories
+            for i, category in enumerate(random.sample(list(unique_categories), k)):
+                category_products = available_products[available_products['Category'] == category]
+                if not category_products.empty:
+                    selected_product = category_products.sample(n=1, random_state=seed+i)
+                    selected_products = pd.concat([selected_products, selected_product])
+        
+        # If strategy 1 failed to get k products, use strategy 2
+        if len(selected_products) < k:
+            # Strategy 2: Sample with price range diversity
+            available_products['PriceGroup'] = pd.qcut(available_products['Price'], 
+                                                   min(4, len(available_products['Price'].unique())), 
+                                                   labels=False, 
+                                                   duplicates='drop')
+            price_groups = available_products['PriceGroup'].unique()
+            selected_products = pd.DataFrame()
             
-            # Find a replacement from a different category
-            possible_replacements = items_df[
-                ~items_df['Product_ID'].isin(recommended['Product_ID']) & 
-                (items_df['Category'] != most_common_category)
-            ]
+            # Try to get products from different price groups
+            products_needed = k
+            for price_group in price_groups:
+                group_products = available_products[available_products['PriceGroup'] == price_group]
+                samples_from_group = min(max(1, products_needed // len(price_groups)), len(group_products))
+                if samples_from_group > 0:
+                    group_selection = group_products.sample(n=samples_from_group, random_state=seed)
+                    selected_products = pd.concat([selected_products, group_selection])
+                    products_needed -= samples_from_group
             
-            if not possible_replacements.empty:
-                replacement = possible_replacements.sample(1)
-                recommended = recommended.drop(to_replace).append(replacement)
+            # If we still need more products, get random ones
+            if products_needed > 0 and not available_products.empty:
+                remaining = available_products[~available_products['Product_ID'].isin(selected_products['Product_ID'])]
+                if not remaining.empty:
+                    additional = remaining.sample(n=min(products_needed, len(remaining)), random_state=seed)
+                    selected_products = pd.concat([selected_products, additional])
+    else:
+        # Not enough products for advanced selection, use all available
+        selected_products = available_products
+    
+    # If we still don't have k products, just take what we can from the original dataframe
+    if len(selected_products) < k and len(items_df) >= k:
+        selected_products = items_df.sample(n=k, random_state=int(hashlib.md5(customer_id.encode()).hexdigest(), 16) % 10000)
+    elif len(selected_products) < k:
+        selected_products = items_df
     
     # Update recommendation history
-    new_recommendations = recommended['Product_ID'].tolist()
+    new_recommendations = selected_products['Product_ID'].tolist()
     st.session_state[SESSION_STATE_KEY][customer_id] = (previous_recommendations + new_recommendations)[-20:]  # Keep last 20
     
-    # Save scores for explanation
-    st.session_state['last_recommendation_scores'] = recommended[['Product_ID', 'total_score', 'category_score', 
-                                                               'price_score', 'demographic_score', 'rating_score']]
-    
-    # Return recommendations without the scoring columns
-    return recommended.drop(columns=['category_score', 'price_score', 'demographic_score', 
-                                      'rating_score', 'novelty_score', 'total_score'])
+    return selected_products.head(k)
 
 def generate_personalized_reason(product: Dict, customer: Dict) -> str:
-    """Generate highly personalized recommendation reason based on multiple factors."""
-    # Check if we have scoring data from the recommendation algorithm
-    if 'last_recommendation_scores' in st.session_state:
-        scores_df = st.session_state['last_recommendation_scores']
-        product_scores = scores_df[scores_df['Product_ID'] == product['Product_ID']]
-        
-        if not product_scores.empty:
-            # Get individual factor scores
-            category_score = product_scores['category_score'].iloc[0]
-            price_score = product_scores['price_score'].iloc[0]
-            demographic_score = product_scores['demographic_score'].iloc[0]
-            rating_score = product_scores['rating_score'].iloc[0]
-            
-            # Determine the strongest factor for personalization
-            max_score = max(category_score, price_score, demographic_score, rating_score)
-            
-            # Generate reason based on strongest factor
-            if max_score == category_score and category_score > 0:
-                browsing = parse_browsing_history(customer.get('Browsing_History', ''))
-                if product['Category'] in browsing:
-                    return f"🧠 Perfect match for your interest in {product['Category']}!"
-                elif product['Subcategory'] in browsing:
-                    return f"🧠 Exactly what you've been browsing in {product['Subcategory']}!"
-                else:
-                    return f"🧠 Aligns perfectly with your browsing history and preferences!"
-                    
-            elif max_score == price_score and price_score > 0:
-                if customer.get('Customer_Segment') == 'Premium':
-                    return f"💎 Premium quality product that matches your excellent taste!"
-                elif customer.get('Customer_Segment') == 'Budget':
-                    return f"💰 Great value that fits your smart shopping preferences!"
-                else:
-                    return f"⚖️ Perfect price point based on your purchasing patterns!"
-                    
-            elif max_score == demographic_score and demographic_score > 0:
-                age = customer.get('Age', 0)
-                location = customer.get('Location', '')
-                
-                if age < 25:
-                    return f"🚀 Popular choice among trendsetters in your age group in {location}!"
-                elif 25 <= age < 40:
-                    return f"👌 Top pick for {location} shoppers in their {age}s like you!"
-                else:
-                    return f"🎯 Specially curated for discerning {location} shoppers in your demographic!"
-                    
-            elif max_score == rating_score and rating_score > 0:
-                return f"⭐ Highly rated ({product['Product_Rating']}/5) product our AI thinks you'll love!"
-    
-    # Fallback to simpler personalization if no scoring data available
+    """Generate personalized recommendation reason."""
     browsing = parse_browsing_history(customer.get('Browsing_History', ''))
     
     # Check if product matches browsing history
     if product['Category'] in browsing or product['Subcategory'] in browsing:
         return f"🧠 You're into {product['Category']} — and this is a perfect match!"
     
-    # Generate reason based on customer attributes
+    # Calculate personalization score (higher means more relevant)
+    personalization_score = 0
+    
+    # Age-based recommendations
     age = customer.get('Age', 0)
+    if age < 25 and product['Category'] in ['Electronics', 'Fashion']:
+        personalization_score += 2
+    elif 25 <= age < 40 and product['Category'] in ['Home & Kitchen', 'Electronics']:
+        personalization_score += 2
+    elif age >= 40 and product['Category'] in ['Health', 'Home & Kitchen']:
+        personalization_score += 2
+    
+    # Location-based recommendations
     location = customer.get('Location', '')
+    if location in ['Urban'] and product['Category'] in ['Electronics', 'Fashion']:
+        personalization_score += 1
+    elif location in ['Suburban'] and product['Category'] in ['Home & Kitchen', 'Garden']:
+        personalization_score += 1
+    elif location in ['Rural'] and product['Category'] in ['Tools', 'Outdoors']:
+        personalization_score += 1
+    
+    # Customer segment-based recommendations
     segment = customer.get('Customer_Segment', '')
+    try:
+        price = float(product.get('Price', 0))
+        if segment in ['Premium'] and price > 2000:
+            personalization_score += 2
+        elif segment in ['Budget'] and price < 1000:
+            personalization_score += 2
+    except (ValueError, TypeError):
+        # Handle case where price isn't a valid number
+        pass
     
-    reasons = [
-        f"💖 Selected for {segment} shoppers in {location} like you!",
-        f"🎯 Matches the preferences of {age}-year-old shoppers!",
-        f"🌟 AI-picked especially for your unique shopping profile!",
-        f"✨ Our algorithm detected your interest in {product['Category']}!"
-    ]
-    
-    return random.choice(reasons)
+    # Choose appropriate reason based on relevance score
+    if personalization_score >= 3:
+        return f"🎯 Perfect match for your {customer['Customer_Segment']} preferences in {customer['Location']}!"
+    elif personalization_score >= 2:
+        return f"💖 Chosen specifically for {customer['Customer_Segment']} shoppers like you!"
+    elif personalization_score >= 1:
+        return f"🛍 Trending among {customer['Location']} shoppers in your age group ({customer['Age']})!"
+    else:
+        # Generic fallback reasons
+        reasons = [
+            f"💫 This would be a great addition to your collection!",
+            f"🌟 Highly rated by customers with similar shopping patterns.",
+            f"✨ Something new to explore based on your interests!",
+            f"🔍 Discovered by our AI just for you!"
+        ]
+        return random.choice(reasons)
 
 # Diverse set of fun facts to avoid repetition
 fun_facts = [
@@ -581,27 +454,17 @@ def main():
                 if products.empty:
                     st.warning("No products found matching your filters! Try adjusting your filter criteria.")
                 else:
-                    # Get diverse recommendations with enhanced accuracy
-                    recommended = get_diverse_recommendations(customer_id, products, customer, 4)
+                    # Get diverse recommendations
+                    recommended = get_diverse_recommendations(customer_id, products, 4)
                     
-                    # Add recommendation explanation
-                    if not recommended.empty:
+                    if recommended.empty:
+                        st.warning("No recommendations available. Try different filters.")
+                    else:
                         st.markdown("### 🌟 Your Smart Recommendations")
                         
                         # Display recommendations in a responsive grid
                         for _, product in recommended.iterrows():
                             render_product_card(product, customer)
-                        
-                        with st.expander("🔍 How our AI selected these products"):
-                            st.markdown("""
-                            Our recommendation system analyzed your profile and browsing patterns to find the perfect products for you.
-                            We considered:
-                            - Your browsing history and category preferences
-                            - Price points appropriate for your customer segment
-                            - Demographic patterns from similar shoppers
-                            - Product ratings and quality metrics
-                            - Products you haven't seen before
-                            """)
                         
                         # Add a "Try Again" button for more recommendations
                         if st.button("🔄 Get More Recommendations"):
